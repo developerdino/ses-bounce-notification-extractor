@@ -201,24 +201,65 @@ func saveAuthRecord(filePath string, record azidentity.AuthenticationRecord) err
 	return os.WriteFile(filePath, data, 0600)
 }
 
+// findFolderByName searches top-level mail folders (all pages) then recurses into child
+// folders if not found at the top level. Returns the folder ID or an error.
+func findFolderByName(ctx context.Context, client *msgraphsdk.GraphServiceClient, displayName string) (string, error) {
+	filterStr := fmt.Sprintf("displayName eq '%s'", displayName)
+	result, err := client.Me().MailFolders().Get(ctx, &users.ItemMailFoldersRequestBuilderGetRequestConfiguration{
+		QueryParameters: &users.ItemMailFoldersRequestBuilderGetQueryParameters{
+			Filter:              &filterStr,
+			IncludeHiddenFolders: func() *string { s := "true"; return &s }(),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to search mail folders: %w", err)
+	}
+
+	for _, f := range result.GetValue() {
+		if f.GetId() != nil {
+			return *f.GetId(), nil
+		}
+	}
+
+	// Not found at top level — check child folders of all top-level folders
+	allFolders, err := client.Me().MailFolders().Get(ctx, &users.ItemMailFoldersRequestBuilderGetRequestConfiguration{
+		QueryParameters: &users.ItemMailFoldersRequestBuilderGetQueryParameters{
+			IncludeHiddenFolders: func() *string { s := "true"; return &s }(),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to list mail folders: %w", err)
+	}
+
+	for _, parent := range allFolders.GetValue() {
+		if parent.GetId() == nil {
+			continue
+		}
+		childFilter := fmt.Sprintf("displayName eq '%s'", displayName)
+		children, err := client.Me().MailFolders().ByMailFolderId(*parent.GetId()).ChildFolders().Get(ctx, &users.ItemMailFoldersItemChildFoldersRequestBuilderGetRequestConfiguration{
+			QueryParameters: &users.ItemMailFoldersItemChildFoldersRequestBuilderGetQueryParameters{
+				Filter: &childFilter,
+			},
+		})
+		if err != nil {
+			continue
+		}
+		for _, f := range children.GetValue() {
+			if f.GetId() != nil {
+				return *f.GetId(), nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("folder '%s' not found in top-level or child folders", displayName)
+}
+
 func findAllBouncedMessages(folderDisplayName string, client *msgraphsdk.GraphServiceClient) ([]Message, error) {
 	var bounceMessages []Message
 
-	// List mail folders to find the folder ID by display name
-	folders, err := client.Me().MailFolders().Get(context.Background(), nil)
+	folderId, err := findFolderByName(context.Background(), client, folderDisplayName)
 	if err != nil {
-		return bounceMessages, fmt.Errorf("failed to get mail folders: %w", err)
-	}
-
-	var folderId string
-	for _, f := range folders.GetValue() {
-		if f.GetDisplayName() != nil && *f.GetDisplayName() == folderDisplayName {
-			folderId = *f.GetId()
-			break
-		}
-	}
-	if folderId == "" {
-		return bounceMessages, fmt.Errorf("folder '%s' not found", folderDisplayName)
+		return bounceMessages, err
 	}
 
 	// Query messages in the folder with the subject filter
